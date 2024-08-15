@@ -1,0 +1,1061 @@
+From b1c9e0243e6e81ec7619c1b818b74cedcba52ebd Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:03 -0500
+Subject: [PATCH 1/9] PCI/AER: Update AER driver to call root port and
+ downstream port UCE handlers
+Status: RO
+Content-Length: 1958
+Lines: 53
+
+The AER service driver does not currently call a handler for AER
+uncorrectable errors (UCE) detected in root ports or downstream
+ports. This is not needed in most cases because common PCIe port
+functionality is handled by portdrv service drivers.
+
+CXL root ports include CXL specific RAS registers that need logging
+before starting do_recovery() in the UCE case.
+
+Update the AER service driver to call the UCE handler for root ports
+and downstream ports. These PCIe port devices are bound to the portdrv
+driver that includes a CE and UCE handler to be called.
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+Cc: Bjorn Helgaas <bhelgaas@google.com>
+Cc: linux-pci@vger.kernel.org
+---
+ drivers/pci/pcie/err.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/pci/pcie/err.c b/drivers/pci/pcie/err.c
+index 31090770fffc..4a457ed64995 100644
+--- a/drivers/pci/pcie/err.c
++++ b/drivers/pci/pcie/err.c
+@@ -197,6 +197,26 @@ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
+ 	pci_ers_result_t status = PCI_ERS_RESULT_CAN_RECOVER;
+ 	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
+ 
++	/*
++	 * PCIe ports may include functionality beyond the standard
++	 * extended port capabilities. This may present a need to log and
++	 * handle errors not addressed in this driver. Examples are CXL
++	 * root ports and CXL downstream switch ports using AER UIE to
++	 * indicate CXL UCE RAS protocol errors.
++	 */
++	if (type == PCI_EXP_TYPE_ROOT_PORT ||
++	    type == PCI_EXP_TYPE_DOWNSTREAM) {
++		struct pci_driver *pdrv = dev->driver;
++
++		if (pdrv && pdrv->err_handler &&
++		    pdrv->err_handler->error_detected) {
++			const struct pci_error_handlers *err_handler;
++
++			err_handler = pdrv->err_handler;
++			status = err_handler->error_detected(dev, state);
++		}
++	}
++
+ 	/*
+ 	 * If the error was detected by a Root Port, Downstream Port, RCEC,
+ 	 * or RCiEP, recovery runs on the device itself.  For Ports, that
+-- 
+2.43.0
+
+
+From b8f14ab902fb3e2c8526c6ca44d692cfb320e19e Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:04 -0500
+Subject: [PATCH 2/9] PCI/AER: Call AER CE handler before clearing AER CE
+ status register
+Status: RO
+Content-Length: 1960
+Lines: 51
+
+The AER service driver clears the AER correctable error (CE) status before
+calling the correctable error handler. This results in the error's status
+not correctly reflected if read from the CE handler.
+
+The AER CE status is needed by the portdrv's CE handler. The portdrv's
+CE handler is intended to only call the registered notifier callbacks
+if the CE error status has correctable internal error (CIE) set.
+
+This is not a problem for AER uncorrrectbale errors (UCE). The UCE status
+is still present in the AER capability and available for reading, if
+needed, when the UCE handler is called.
+
+Change the order of clearing the CE status and calling the CE handler.
+Make it to call the CE handler first and then clear the CE status
+after returning.
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+Cc: Bjorn Helgaas <bhelgaas@google.com>
+Cc: linux-pci@vger.kernel.org
+---
+ drivers/pci/pcie/aer.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/pcie/aer.c b/drivers/pci/pcie/aer.c
+index ac6293c24976..4dc03cb9aff0 100644
+--- a/drivers/pci/pcie/aer.c
++++ b/drivers/pci/pcie/aer.c
+@@ -1094,9 +1094,6 @@ static void pci_aer_handle_error(struct pci_dev *dev, struct aer_err_info *info)
+ 		 * Correctable error does not need software intervention.
+ 		 * No need to go through error recovery process.
+ 		 */
+-		if (aer)
+-			pci_write_config_dword(dev, aer + PCI_ERR_COR_STATUS,
+-					info->status);
+ 		if (pcie_aer_is_native(dev)) {
+ 			struct pci_driver *pdrv = dev->driver;
+ 
+@@ -1105,6 +1102,10 @@ static void pci_aer_handle_error(struct pci_dev *dev, struct aer_err_info *info)
+ 				pdrv->err_handler->cor_error_detected(dev);
+ 			pcie_clear_device_status(dev);
+ 		}
++		if (aer)
++			pci_write_config_dword(dev, aer + PCI_ERR_COR_STATUS,
++					info->status);
++
+ 	} else if (info->severity == AER_NONFATAL)
+ 		pcie_do_recovery(dev, pci_channel_io_normal, aer_root_reset);
+ 	else if (info->severity == AER_FATAL)
+-- 
+2.43.0
+
+
+From bbc6bcba99045905e1b6664915604fa8ce3bb236 Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:05 -0500
+Subject: [PATCH 3/9] PCI/portdrv: Update portdrv with an atomic notifier for
+ reporting AER internal errors
+Status: RO
+Content-Length: 4013
+Lines: 112
+
+PCIe port devices are bound to portdrv, the PCIe port bus driver. portdrv
+does not implement an AER correctable handler (CE) but does implement the
+AER uncorrectable error (UCE). The UCE handler is fairly straightforward
+in that it only checks for frozen error state and returns the next step
+for recovery accordingly.
+
+As a result, port devices relying on AER correctable internal errors (CIE)
+and AER uncorrectable internal errors (UIE) will not be handled. Note,
+the PCIe spec indicates AER CIE/UIE can be used to report implementation
+specific errors.[1]
+
+CXL root ports, CXL downstream switch ports, and CXL upstream switch ports
+are examples of devices using the AER CIE/UIE for implementation specific
+purposes. These CXL ports use the AER interrupt and AER CIE/UIE status to
+report CXL RAS errors.[2]
+
+Add an atomic notifier to portdrv's CE/UCE handlers. Use the atomic
+notifier to report CIE/UIE errors to the registered functions. This will
+require adding a CE handler and updating the existing UCE handler.
+
+For the UCE handler, the CXL spec states UIE errors should return need
+reset: "The only method of recovering from an Uncorrectable Internal Error
+is reset or hardware replacement."[1]
+
+[1] PCI6.0 - 6.2.10 Internal Errors
+[2] CXL3.1 - 12.2.2 CXL Root Ports, Downstream Switch Ports, and
+             Upstream Switch Ports
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+Cc: Bjorn Helgaas <bhelgaas@google.com>
+Cc: linux-pci@vger.kernel.org
+---
+ drivers/pci/pcie/portdrv.c | 32 ++++++++++++++++++++++++++++++++
+ drivers/pci/pcie/portdrv.h |  2 ++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/drivers/pci/pcie/portdrv.c b/drivers/pci/pcie/portdrv.c
+index bb65dfe43409..4300c417e111 100644
+--- a/drivers/pci/pcie/portdrv.c
++++ b/drivers/pci/pcie/portdrv.c
+@@ -37,6 +37,9 @@ struct portdrv_service_data {
+ 	u32 service;
+ };
+ 
++ATOMIC_NOTIFIER_HEAD(portdrv_aer_internal_err_chain);
++EXPORT_SYMBOL_GPL(portdrv_aer_internal_err_chain);
++
+ /**
+  * release_pcie_device - free PCI Express port service device structure
+  * @dev: Port service device to release
+@@ -745,11 +748,39 @@ static void pcie_portdrv_shutdown(struct pci_dev *dev)
+ static pci_ers_result_t pcie_portdrv_error_detected(struct pci_dev *dev,
+ 					pci_channel_state_t error)
+ {
++	if (dev->aer_cap) {
++		u32 status;
++
++		pci_read_config_dword(dev, dev->aer_cap + PCI_ERR_UNCOR_STATUS,
++				      &status);
++
++		if (status & PCI_ERR_UNC_INTN) {
++			atomic_notifier_call_chain(&portdrv_aer_internal_err_chain,
++						   AER_FATAL, (void *)dev);
++			return PCI_ERS_RESULT_NEED_RESET;
++		}
++	}
++
+ 	if (error == pci_channel_io_frozen)
+ 		return PCI_ERS_RESULT_NEED_RESET;
+ 	return PCI_ERS_RESULT_CAN_RECOVER;
+ }
+ 
++static void pcie_portdrv_cor_error_detected(struct pci_dev *dev)
++{
++	u32 status;
++
++	if (!dev->aer_cap)
++		return;
++
++	pci_read_config_dword(dev, dev->aer_cap + PCI_ERR_COR_STATUS,
++			      &status);
++
++	if (status & PCI_ERR_COR_INTERNAL)
++		atomic_notifier_call_chain(&portdrv_aer_internal_err_chain,
++					   AER_CORRECTABLE, (void *)dev);
++}
++
+ static pci_ers_result_t pcie_portdrv_slot_reset(struct pci_dev *dev)
+ {
+ 	size_t off = offsetof(struct pcie_port_service_driver, slot_reset);
+@@ -780,6 +811,7 @@ static const struct pci_device_id port_pci_ids[] = {
+ 
+ static const struct pci_error_handlers pcie_portdrv_err_handler = {
+ 	.error_detected = pcie_portdrv_error_detected,
++	.cor_error_detected = pcie_portdrv_cor_error_detected,
+ 	.slot_reset = pcie_portdrv_slot_reset,
+ 	.mmio_enabled = pcie_portdrv_mmio_enabled,
+ };
+diff --git a/drivers/pci/pcie/portdrv.h b/drivers/pci/pcie/portdrv.h
+index 12c89ea0313b..8a39197f0203 100644
+--- a/drivers/pci/pcie/portdrv.h
++++ b/drivers/pci/pcie/portdrv.h
+@@ -121,4 +121,6 @@ static inline void pcie_pme_interrupt_enable(struct pci_dev *dev, bool en) {}
+ #endif /* !CONFIG_PCIE_PME */
+ 
+ struct device *pcie_port_find_device(struct pci_dev *dev, u32 service);
++
++extern struct atomic_notifier_head portdrv_aer_internal_err_chain;
+ #endif /* _PORTDRV_H_ */
+-- 
+2.43.0
+
+
+From 84f88f3bce101cda11ac7c430dc9d6799d2f674a Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:06 -0500
+Subject: [PATCH 4/9] cxl/pci: Map CXL PCIe ports' RAS registers
+Status: RO
+Content-Length: 6083
+Lines: 174
+
+RAS registers are not currently mapped for CXL root ports, CXL downstream
+switch ports, and CXL upstream switch ports. Update the driver to map the
+ports' RAS registers in preparation for RAS logging and handling to be
+added in the future.
+
+Add a 'struct cxl_regs' variable to 'struct cxl_port'. This will be used
+to store a pointer to the upstream port's mapped RAS registers.
+
+Invoke the RAS mapping logic from the CXL memory device probe routine
+after the endpoint is added. This ensures the ports have completed
+training and the RAS registers are present in CXL.cachemem.
+
+Refactor the cxl_dport_map_regs() function to support mapping the CXL
+PCIe ports. Also, check for previously mapped registers in the topology
+including CXL switch. Endpoints under a CXL switch share a CXL root port
+and will be iterated for each endpoint. Only map once.
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+---
+ drivers/cxl/core/pci.c | 30 +++++++++++++++++++++++++-----
+ drivers/cxl/cxl.h      |  5 +++++
+ drivers/cxl/mem.c      | 32 ++++++++++++++++++++++++++++++--
+ 3 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 8567dd11eaac..794b7decc36d 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -787,16 +787,26 @@ static void cxl_dport_map_rch_aer(struct cxl_dport *dport)
+ 	dport->regs.dport_aer = dport_aer;
+ }
+ 
+-static void cxl_dport_map_regs(struct cxl_dport *dport)
++static void cxl_port_map_regs(struct device *dev,
++			      struct cxl_register_map *map,
++			      struct cxl_regs *regs)
+ {
+-	struct cxl_register_map *map = &dport->reg_map;
+-	struct device *dev = dport->dport_dev;
+-
+ 	if (!map->component_map.ras.valid)
+ 		dev_dbg(dev, "RAS registers not found\n");
+-	else if (cxl_map_component_regs(map, &dport->regs.component,
++	else if (regs->ras)
++		dev_dbg(dev, "RAS registers already initialized\n");
++	else if (cxl_map_component_regs(map, &regs->component,
+ 					BIT(CXL_CM_CAP_CAP_ID_RAS)))
+ 		dev_dbg(dev, "Failed to map RAS capability.\n");
++}
++
++static void cxl_dport_map_regs(struct cxl_dport *dport)
++{
++	struct cxl_register_map *map = &dport->reg_map;
++	struct cxl_regs *regs = &dport->regs;
++	struct device *dev = dport->dport_dev;
++
++	cxl_port_map_regs(dev, map, regs);
+ 
+ 	if (dport->rch)
+ 		cxl_dport_map_rch_aer(dport);
+@@ -831,6 +841,16 @@ static void cxl_disable_rch_root_ints(struct cxl_dport *dport)
+ 	}
+ }
+ 
++void cxl_setup_parent_uport(struct device *host, struct cxl_port *port)
++{
++	struct cxl_register_map *map = &port->reg_map;
++	struct cxl_regs *regs = &port->regs;
++	struct device *uport_dev = port->uport_dev;
++
++	cxl_port_map_regs(uport_dev, map, regs);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_setup_parent_uport, CXL);
++
+ void cxl_setup_parent_dport(struct device *host, struct cxl_dport *dport)
+ {
+ 	struct device *dport_dev = dport->dport_dev;
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index a6613a6f8923..99852f92256c 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -591,6 +591,7 @@ struct cxl_dax_region {
+  * @parent_dport: dport that points to this port in the parent
+  * @decoder_ida: allocator for decoder ids
+  * @reg_map: component and ras register mapping parameters
++ * @regs: mapped component registers
+  * @nr_dports: number of entries in @dports
+  * @hdm_end: track last allocated HDM decoder instance for allocation ordering
+  * @commit_end: cursor to track highest committed decoder for commit ordering
+@@ -611,6 +612,7 @@ struct cxl_port {
+ 	struct cxl_dport *parent_dport;
+ 	struct ida decoder_ida;
+ 	struct cxl_register_map reg_map;
++	struct cxl_regs regs;
+ 	int nr_dports;
+ 	int hdm_end;
+ 	int commit_end;
+@@ -761,9 +763,12 @@ struct cxl_dport *devm_cxl_add_rch_dport(struct cxl_port *port,
+ 
+ #ifdef CONFIG_PCIEAER_CXL
+ void cxl_setup_parent_dport(struct device *host, struct cxl_dport *dport);
++void cxl_setup_parent_uport(struct device *host, struct cxl_port *port);
+ #else
+ static inline void cxl_setup_parent_dport(struct device *host,
+ 					  struct cxl_dport *dport) { }
++static inline void cxl_setup_parent_uport(struct device *host,
++					  struct cxl_port *port) { }
+ #endif
+ 
+ struct cxl_decoder *to_cxl_decoder(struct device *dev);
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index 01691e9feaa1..4da927e6a5d9 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -45,10 +45,39 @@ static int cxl_mem_dpa_show(struct seq_file *file, void *data)
+ 	return 0;
+ }
+ 
++static bool cxl_dev_is_pci_type(struct device *dev, u32 pcie_type)
++{
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(dev))
++		return false;
++
++	pdev = to_pci_dev(dev);
++	if (pci_pcie_type(pdev) != pcie_type)
++		return false;
++
++	return pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
++					 CXL_DVSEC_REG_LOCATOR);
++}
++
++static void cxl_setup_ep_parent_ports(struct cxl_ep *ep, struct device *host)
++{
++	struct cxl_dport *dport = ep->dport;
++
++	if (cxl_dev_is_pci_type(dport->dport_dev, PCI_EXP_TYPE_DOWNSTREAM) ||
++	    cxl_dev_is_pci_type(dport->dport_dev, PCI_EXP_TYPE_ROOT_PORT))
++		cxl_setup_parent_dport(host, ep->dport);
++
++	if (cxl_dev_is_pci_type(dport->port->uport_dev, PCI_EXP_TYPE_UPSTREAM))
++		cxl_setup_parent_uport(host, ep->dport->port);
++}
++
+ static int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
+ 				 struct cxl_dport *parent_dport)
+ {
+ 	struct cxl_port *parent_port = parent_dport->port;
++	struct cxl_dev_state *cxlds = cxlmd->cxlds;
++	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
+ 	struct cxl_port *endpoint, *iter, *down;
+ 	int rc;
+ 
+@@ -62,6 +91,7 @@ static int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
+ 
+ 		ep = cxl_ep_load(iter, cxlmd);
+ 		ep->next = down;
++		cxl_setup_ep_parent_ports(ep, &pdev->dev);
+ 	}
+ 
+ 	/* Note: endpoint port component registers are derived from @cxlds */
+@@ -170,8 +200,6 @@ static int cxl_mem_probe(struct device *dev)
+ 	else
+ 		endpoint_parent = &parent_port->dev;
+ 
+-	cxl_setup_parent_dport(dev, dport);
+-
+ 	device_lock(endpoint_parent);
+ 	if (!endpoint_parent->driver) {
+ 		dev_err(dev, "CXL port topology %s not enabled\n",
+-- 
+2.43.0
+
+
+From 915158ac72eabeb21f3f1a1f85dfde09b73c6b0b Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:07 -0500
+Subject: [PATCH 5/9] cxl/pci: Update RAS handler interfaces to support CXL
+ PCIe ports
+Status: O
+Content-Length: 3659
+Lines: 103
+
+CXL RAS error handling includes support for endpoints and RCH downstream
+ports. The same support is missing for CXL root ports, CXL downstream
+switch ports, and CXL upstream switch ports. This patch is in preparation
+for adding CXL ports' RAS handling.
+
+The cxl_pci driver's RAS support functions use the 'struct cxl_dev_state'
+type parameter that is not available in CXL port devices. The same CXL
+RAS capability structure is required for most CXL components/devices
+and should have common handling where possible.[1]
+
+Update __cxl_handle_cor_ras() and __cxl_handle_ras() to use 'struct
+device' instead of 'struct cxl_dev_state'. Add function call to translate
+device to CXL device state where needed.
+
+[1] CXL3.1 - 8.2.4 CXL.cache and CXL.mem Registers
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+---
+ drivers/cxl/core/pci.c | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 794b7decc36d..9cc5de1f7523 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -686,9 +686,10 @@ void read_cdat_data(struct cxl_port *port)
+ }
+ EXPORT_SYMBOL_NS_GPL(read_cdat_data, CXL);
+ 
+-static void __cxl_handle_cor_ras(struct cxl_dev_state *cxlds,
++static void __cxl_handle_cor_ras(struct device *dev,
+ 				 void __iomem *ras_base)
+ {
++	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+ 	void __iomem *addr;
+ 	u32 status;
+ 
+@@ -699,13 +700,13 @@ static void __cxl_handle_cor_ras(struct cxl_dev_state *cxlds,
+ 	status = readl(addr);
+ 	if (status & CXL_RAS_CORRECTABLE_STATUS_MASK) {
+ 		writel(status & CXL_RAS_CORRECTABLE_STATUS_MASK, addr);
+-		trace_cxl_aer_correctable_error(cxlds->cxlmd, status);
++		trace_cxl_aer_correctable_error(cxlmd, status);
+ 	}
+ }
+ 
+ static void cxl_handle_endpoint_cor_ras(struct cxl_dev_state *cxlds)
+ {
+-	return __cxl_handle_cor_ras(cxlds, cxlds->regs.ras);
++	return __cxl_handle_cor_ras(&cxlds->cxlmd->dev, cxlds->regs.ras);
+ }
+ 
+ /* CXL spec rev3.0 8.2.4.16.1 */
+@@ -729,9 +730,10 @@ static void header_log_copy(void __iomem *ras_base, u32 *log)
+  * Log the state of the RAS status registers and prepare them to log the
+  * next error status. Return 1 if reset needed.
+  */
+-static bool __cxl_handle_ras(struct cxl_dev_state *cxlds,
+-				  void __iomem *ras_base)
++static bool __cxl_handle_ras(struct device *dev,
++			     void __iomem *ras_base)
+ {
++	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+ 	u32 hl[CXL_HEADERLOG_SIZE_U32];
+ 	void __iomem *addr;
+ 	u32 status;
+@@ -757,7 +759,7 @@ static bool __cxl_handle_ras(struct cxl_dev_state *cxlds,
+ 	}
+ 
+ 	header_log_copy(ras_base, hl);
+-	trace_cxl_aer_uncorrectable_error(cxlds->cxlmd, status, fe, hl);
++	trace_cxl_aer_uncorrectable_error(cxlmd, status, fe, hl);
+ 	writel(status & CXL_RAS_UNCORRECTABLE_STATUS_MASK, addr);
+ 
+ 	return true;
+@@ -765,7 +767,7 @@ static bool __cxl_handle_ras(struct cxl_dev_state *cxlds,
+ 
+ static bool cxl_handle_endpoint_ras(struct cxl_dev_state *cxlds)
+ {
+-	return __cxl_handle_ras(cxlds, cxlds->regs.ras);
++	return __cxl_handle_ras(&cxlds->cxlmd->dev, cxlds->regs.ras);
+ }
+ 
+ #ifdef CONFIG_PCIEAER_CXL
+@@ -871,13 +873,13 @@ EXPORT_SYMBOL_NS_GPL(cxl_setup_parent_dport, CXL);
+ static void cxl_handle_rdport_cor_ras(struct cxl_dev_state *cxlds,
+ 					  struct cxl_dport *dport)
+ {
+-	return __cxl_handle_cor_ras(cxlds, dport->regs.ras);
++	return __cxl_handle_cor_ras(&cxlds->cxlmd->dev, dport->regs.ras);
+ }
+ 
+ static bool cxl_handle_rdport_ras(struct cxl_dev_state *cxlds,
+ 				       struct cxl_dport *dport)
+ {
+-	return __cxl_handle_ras(cxlds, dport->regs.ras);
++	return __cxl_handle_ras(&cxlds->cxlmd->dev, dport->regs.ras);
+ }
+ 
+ /*
+-- 
+2.43.0
+
+
+From 1a091b437d81497aa4f5fabd16cd61bcdfa410e5 Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:08 -0500
+Subject: [PATCH 6/9] cxl/pci: Add trace logging for CXL PCIe port RAS errors
+Status: O
+Content-Length: 1908
+Lines: 67
+
+The cxl_pci driver uses kernel trace functions to log RAS errors for
+endpoints and RCH downstream ports. The same is needed for CXL root ports,
+CXL downstream switch ports, and CXL upstream switch ports.
+
+Add RAS correctable and RAS uncorrectable trace logging functions for
+CXL PCIE ports.
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+---
+ drivers/cxl/core/trace.h | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/drivers/cxl/core/trace.h b/drivers/cxl/core/trace.h
+index ee5cd4eb2f16..dc3f4a2e1555 100644
+--- a/drivers/cxl/core/trace.h
++++ b/drivers/cxl/core/trace.h
+@@ -48,6 +48,23 @@
+ 	{ CXL_RAS_UC_IDE_RX_ERR, "IDE Rx Error" }			  \
+ )
+ 
++TRACE_EVENT(cxl_port_aer_uncorrectable_error,
++	TP_PROTO(struct device *dev, u32 status),
++	TP_ARGS(dev, status),
++	TP_STRUCT__entry(
++		__string(devname, dev_name(dev))
++		__field(u32, status)
++	),
++	TP_fast_assign(
++		__assign_str(devname, dev_name(dev));
++		__entry->status = status;
++	),
++	TP_printk("device=%s status='%s'",
++		  __get_str(devname),
++		  show_uc_errs(__entry->status)
++	)
++);
++
+ TRACE_EVENT(cxl_aer_uncorrectable_error,
+ 	TP_PROTO(const struct cxl_memdev *cxlmd, u32 status, u32 fe, u32 *hl),
+ 	TP_ARGS(cxlmd, status, fe, hl),
+@@ -96,6 +113,23 @@ TRACE_EVENT(cxl_aer_uncorrectable_error,
+ 	{ CXL_RAS_CE_PHYS_LAYER_ERR, "Received Error From Physical Layer" }	\
+ )
+ 
++TRACE_EVENT(cxl_port_aer_correctable_error,
++	TP_PROTO(struct device *dev, u32 status),
++	TP_ARGS(dev, status),
++	TP_STRUCT__entry(
++		__string(devname, dev_name(dev))
++		__field(u32, status)
++	),
++	TP_fast_assign(
++		__assign_str(devname, dev_name(dev));
++		__entry->status = status;
++	),
++	TP_printk("device=%s status='%s'",
++		  __get_str(devname),
++		  show_ce_errs(__entry->status)
++	)
++);
++
+ TRACE_EVENT(cxl_aer_correctable_error,
+ 	TP_PROTO(const struct cxl_memdev *cxlmd, u32 status),
+ 	TP_ARGS(cxlmd, status),
+-- 
+2.43.0
+
+
+From 31257135642266a456eb4c20e5022b696f97a4f1 Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:09 -0500
+Subject: [PATCH 7/9] cxl/pci: Add atomic notifier callback for CXL PCIe port
+ AER internal errors
+Status: O
+Content-Length: 9898
+Lines: 302
+
+CXL root ports, CXL downstream switch ports, and CXL upstream switch
+ports are bound to the PCIe port bus driver, portdrv. portdrv provides
+an atomic notifier chain for reporting PCIe port device AER
+correctable internal errors (CIE) and AER uncorrectable internal
+errors (UIE).
+
+CXL PCIe port devices use AER CIE/UIE to report CXL RAS.[1]
+
+Add a cxl_pci atomic notification callback for handling the portdrv's
+AER UIE/CIE notifications.
+
+Register the atomic notification callback in the cxl_pci module's
+load. Unregister the callback in the cxl_pci driver's unload.
+
+Implement the callback to check if the device parameter is a valid
+CXL PCIe port. If it is valid then make the notification callback call
+__cxl_handle_cor_ras() or __cxl_handle_ras() depending on the AER
+type.
+
+[1] CXL3.1 - 12.2.2 CXL Root Ports, Downstream Switch Ports, and
+             Upstream Switch Ports
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+---
+ drivers/cxl/core/core.h  |  4 ++
+ drivers/cxl/core/pci.c   | 97 +++++++++++++++++++++++++++++++++++++---
+ drivers/cxl/core/port.c  |  6 +--
+ drivers/cxl/core/trace.h |  4 +-
+ drivers/cxl/cxl.h        |  5 +++
+ drivers/cxl/cxlpci.h     |  2 +
+ drivers/cxl/pci.c        |  6 +++
+ 7 files changed, 113 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index 625394486459..6ba4de3b48df 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -108,4 +108,8 @@ int cxl_update_hmat_access_coordinates(int nid, struct cxl_region *cxlr,
+ 				       enum access_coordinate_class access);
+ bool cxl_need_node_perf_attrs_update(int nid);
+ 
++struct cxl_dport *find_dport(struct cxl_port *port, int id);
++struct cxl_port *find_cxl_port(struct device *dport_dev,
++			       struct cxl_dport **dport);
++
+ #endif /* __CXL_CORE_H__ */
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 9cc5de1f7523..c76aa9b460b0 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -689,7 +689,6 @@ EXPORT_SYMBOL_NS_GPL(read_cdat_data, CXL);
+ static void __cxl_handle_cor_ras(struct device *dev,
+ 				 void __iomem *ras_base)
+ {
+-	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+ 	void __iomem *addr;
+ 	u32 status;
+ 
+@@ -698,10 +697,17 @@ static void __cxl_handle_cor_ras(struct device *dev,
+ 
+ 	addr = ras_base + CXL_RAS_CORRECTABLE_STATUS_OFFSET;
+ 	status = readl(addr);
+-	if (status & CXL_RAS_CORRECTABLE_STATUS_MASK) {
+-		writel(status & CXL_RAS_CORRECTABLE_STATUS_MASK, addr);
++
++	if (!(status & CXL_RAS_CORRECTABLE_STATUS_MASK))
++		return;
++
++	writel(status & CXL_RAS_CORRECTABLE_STATUS_MASK, addr);
++	if (is_cxl_memdev(dev)) {
++		struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
++
+ 		trace_cxl_aer_correctable_error(cxlmd, status);
+-	}
++	} else if (dev_is_pci(dev))
++		trace_cxl_port_aer_correctable_error(dev, status);
+ }
+ 
+ static void cxl_handle_endpoint_cor_ras(struct cxl_dev_state *cxlds)
+@@ -733,7 +739,6 @@ static void header_log_copy(void __iomem *ras_base, u32 *log)
+ static bool __cxl_handle_ras(struct device *dev,
+ 			     void __iomem *ras_base)
+ {
+-	struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
+ 	u32 hl[CXL_HEADERLOG_SIZE_U32];
+ 	void __iomem *addr;
+ 	u32 status;
+@@ -759,7 +764,13 @@ static bool __cxl_handle_ras(struct device *dev,
+ 	}
+ 
+ 	header_log_copy(ras_base, hl);
+-	trace_cxl_aer_uncorrectable_error(cxlmd, status, fe, hl);
++	if (is_cxl_memdev(dev)) {
++		struct cxl_memdev *cxlmd = to_cxl_memdev(dev);
++
++		trace_cxl_aer_uncorrectable_error(cxlmd, status, fe, hl);
++	} else if (dev_is_pci(dev))
++		trace_cxl_port_aer_uncorrectable_error(dev, status);
++
+ 	writel(status & CXL_RAS_UNCORRECTABLE_STATUS_MASK, addr);
+ 
+ 	return true;
+@@ -882,6 +893,80 @@ static bool cxl_handle_rdport_ras(struct cxl_dev_state *cxlds,
+ 	return __cxl_handle_ras(&cxlds->cxlmd->dev, dport->regs.ras);
+ }
+ 
++static int match_uport(struct device *dev, void *data)
++{
++	struct device *uport_dev = (struct device *)data;
++	struct cxl_port *port;
++
++	if (!is_cxl_port(dev))
++		return 0;
++
++	port = to_cxl_port(dev);
++
++	return (port->uport_dev == uport_dev);
++}
++
++static struct cxl_port *pci_to_cxl_uport(struct pci_dev *pdev)
++{
++	struct cxl_dport *dport;
++	struct device *port_dev;
++	struct cxl_port *port;
++
++	port = find_cxl_port(pdev->dev.parent, &dport);
++	if (!port)
++		return NULL;
++	put_device(&port->dev);
++
++	port_dev = device_find_child(&port->dev, &pdev->dev, match_uport);
++	if (!port_dev)
++		return NULL;
++	put_device(port_dev);
++
++	port = to_cxl_port(port_dev);
++
++	return port;
++}
++
++static void __iomem *cxl_pci_port_ras(struct pci_dev *pdev)
++{
++	void __iomem *ras_base = NULL;
++
++	if ((pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT) ||
++	    (pci_pcie_type(pdev) == PCI_EXP_TYPE_DOWNSTREAM)) {
++		struct cxl_dport *dport;
++
++		find_cxl_port(&pdev->dev, &dport);
++		ras_base = dport ? dport->regs.ras : NULL;
++	} else if (pci_pcie_type(pdev) == PCI_EXP_TYPE_UPSTREAM) {
++		struct cxl_port *port = pci_to_cxl_uport(pdev);
++
++		ras_base = port ? port->regs.ras : NULL;
++	}
++
++	return ras_base;
++}
++
++int port_internal_err_cb(struct notifier_block *unused,
++			 unsigned long event, void *ptr)
++{
++	struct pci_dev *pdev = (struct pci_dev *)ptr;
++	void __iomem *ras_base;
++
++	if (!pdev)
++		return 0;
++
++	if (event == AER_CORRECTABLE) {
++		ras_base = cxl_pci_port_ras(pdev);
++		__cxl_handle_cor_ras(&pdev->dev, ras_base);
++	} else if ((event == AER_FATAL) || (event == AER_NONFATAL)) {
++		ras_base = cxl_pci_port_ras(pdev);
++		__cxl_handle_ras(&pdev->dev, ras_base);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(port_internal_err_cb, CXL);
++
+ /*
+  * Copy the AER capability registers using 32 bit read accesses.
+  * This is necessary because RCRB AER capability is MMIO mapped. Clear the
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 887ed6e358fb..d0f95c965ab4 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1027,7 +1027,7 @@ void put_cxl_root(struct cxl_root *cxl_root)
+ }
+ EXPORT_SYMBOL_NS_GPL(put_cxl_root, CXL);
+ 
+-static struct cxl_dport *find_dport(struct cxl_port *port, int id)
++struct cxl_dport *find_dport(struct cxl_port *port, int id)
+ {
+ 	struct cxl_dport *dport;
+ 	unsigned long index;
+@@ -1336,8 +1336,8 @@ static struct cxl_port *__find_cxl_port(struct cxl_find_port_ctx *ctx)
+ 	return NULL;
+ }
+ 
+-static struct cxl_port *find_cxl_port(struct device *dport_dev,
+-				      struct cxl_dport **dport)
++struct cxl_port *find_cxl_port(struct device *dport_dev,
++			       struct cxl_dport **dport)
+ {
+ 	struct cxl_find_port_ctx ctx = {
+ 		.dport_dev = dport_dev,
+diff --git a/drivers/cxl/core/trace.h b/drivers/cxl/core/trace.h
+index dc3f4a2e1555..1c1df13c9a5d 100644
+--- a/drivers/cxl/core/trace.h
++++ b/drivers/cxl/core/trace.h
+@@ -56,7 +56,7 @@ TRACE_EVENT(cxl_port_aer_uncorrectable_error,
+ 		__field(u32, status)
+ 	),
+ 	TP_fast_assign(
+-		__assign_str(devname, dev_name(dev));
++		__string(devname, dev_name(dev));
+ 		__entry->status = status;
+ 	),
+ 	TP_printk("device=%s status='%s'",
+@@ -121,7 +121,7 @@ TRACE_EVENT(cxl_port_aer_correctable_error,
+ 		__field(u32, status)
+ 	),
+ 	TP_fast_assign(
+-		__assign_str(devname, dev_name(dev));
++		__string(devname, dev_name(dev));
+ 		__entry->status = status;
+ 	),
+ 	TP_printk("device=%s status='%s'",
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 99852f92256c..2bdea3dcadd4 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -11,6 +11,7 @@
+ #include <linux/log2.h>
+ #include <linux/node.h>
+ #include <linux/io.h>
++#include "../pci/pcie/portdrv.h"
+ 
+ extern const struct nvdimm_security_ops *cxl_security_ops;
+ 
+@@ -764,11 +765,15 @@ struct cxl_dport *devm_cxl_add_rch_dport(struct cxl_port *port,
+ #ifdef CONFIG_PCIEAER_CXL
+ void cxl_setup_parent_dport(struct device *host, struct cxl_dport *dport);
+ void cxl_setup_parent_uport(struct device *host, struct cxl_port *port);
++int port_internal_err_cb(struct notifier_block *unused,
++			 unsigned long event, void *ptr);
+ #else
+ static inline void cxl_setup_parent_dport(struct device *host,
+ 					  struct cxl_dport *dport) { }
+ static inline void cxl_setup_parent_uport(struct device *host,
+ 					  struct cxl_port *port) { }
++static inline int port_internal_err_cb(struct notifier_block *unused,
++				unsigned long event, void *ptr) { return 0; }
+ #endif
+ 
+ struct cxl_decoder *to_cxl_decoder(struct device *dev);
+diff --git a/drivers/cxl/cxlpci.h b/drivers/cxl/cxlpci.h
+index 4da07727ab9c..84277fa15b93 100644
+--- a/drivers/cxl/cxlpci.h
++++ b/drivers/cxl/cxlpci.h
+@@ -129,4 +129,6 @@ void read_cdat_data(struct cxl_port *port);
+ void cxl_cor_error_detected(struct pci_dev *pdev);
+ pci_ers_result_t cxl_error_detected(struct pci_dev *pdev,
+ 				    pci_channel_state_t state);
++int port_err_nb_cb(struct notifier_block *unused,
++		   unsigned long event, void *ptr);
+ #endif /* __CXL_PCI_H__ */
+diff --git a/drivers/cxl/pci.c b/drivers/cxl/pci.c
+index e53646e9f2fb..db74e34a962e 100644
+--- a/drivers/cxl/pci.c
++++ b/drivers/cxl/pci.c
+@@ -926,6 +926,10 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return rc;
+ }
+ 
++struct notifier_block port_internal_err_nb = {
++	.notifier_call = port_internal_err_cb,
++};
++
+ static const struct pci_device_id cxl_mem_pci_tbl[] = {
+ 	/* PCI class code for CXL.mem Type-3 Devices */
+ 	{ PCI_DEVICE_CLASS((PCI_CLASS_MEMORY_CXL << 8 | CXL_MEMORY_PROGIF), ~0)},
+@@ -1046,6 +1050,7 @@ static int __init cxl_pci_driver_init(void)
+ {
+ 	int rc;
+ 
++	atomic_notifier_chain_register(&portdrv_aer_internal_err_chain, &port_internal_err_nb);
+ 	rc = pci_register_driver(&cxl_pci_driver);
+ 	if (rc)
+ 		return rc;
+@@ -1059,6 +1064,7 @@ static int __init cxl_pci_driver_init(void)
+ 
+ static void __exit cxl_pci_driver_exit(void)
+ {
++	atomic_notifier_chain_unregister(&portdrv_aer_internal_err_chain, &port_internal_err_nb);
+ 	cxl_cper_unregister_work(&cxl_cper_work);
+ 	cancel_work_sync(&cxl_cper_work);
+ 	pci_unregister_driver(&cxl_pci_driver);
+-- 
+2.43.0
+
+
+From 064927df1ccf1a578729e1f7fa3ded8d884fb472 Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:10 -0500
+Subject: [PATCH 8/9] PCI/AER: Export pci_aer_unmask_internal_errors()
+Status: O
+Content-Length: 2196
+Lines: 62
+
+AER correctable internal errors (CIE) and AER uncorrectable internal
+errors (UIE) are disabled through the AER mask register by default.[1]
+
+CXL PCIe ports use the CIE/UIE to report RAS errors and as a result
+need CIE/UIE enabled.[2]
+
+Change pci_aer_unmask_internal_errors() function to be exported for
+the CXL driver and other drivers to use.
+
+[1] PCI6.0 - 7.8.4.3 Uncorrectable
+[2] CXL3.1 - 12.2.2 CXL Root Ports, Downstream Switch Ports, and Upstream
+             Switch Ports
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+Cc: Bjorn Helgaas <bhelgaas@google.com>
+Cc: linux-pci@vger.kernel.org
+---
+ drivers/pci/pcie/aer.c | 3 ++-
+ include/linux/aer.h    | 6 ++++++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pci/pcie/aer.c b/drivers/pci/pcie/aer.c
+index 4dc03cb9aff0..d7a1982f0c50 100644
+--- a/drivers/pci/pcie/aer.c
++++ b/drivers/pci/pcie/aer.c
+@@ -951,7 +951,7 @@ static bool find_source_device(struct pci_dev *parent,
+  * Note: AER must be enabled and supported by the device which must be
+  * checked in advance, e.g. with pcie_aer_is_native().
+  */
+-static void pci_aer_unmask_internal_errors(struct pci_dev *dev)
++void pci_aer_unmask_internal_errors(struct pci_dev *dev)
+ {
+ 	int aer = dev->aer_cap;
+ 	u32 mask;
+@@ -964,6 +964,7 @@ static void pci_aer_unmask_internal_errors(struct pci_dev *dev)
+ 	mask &= ~PCI_ERR_COR_INTERNAL;
+ 	pci_write_config_dword(dev, aer + PCI_ERR_COR_MASK, mask);
+ }
++EXPORT_SYMBOL_GPL(pci_aer_unmask_internal_errors);
+ 
+ static bool is_cxl_mem_dev(struct pci_dev *dev)
+ {
+diff --git a/include/linux/aer.h b/include/linux/aer.h
+index 4b97f38f3fcf..a4fd25ea0280 100644
+--- a/include/linux/aer.h
++++ b/include/linux/aer.h
+@@ -50,6 +50,12 @@ static inline int pci_aer_clear_nonfatal_status(struct pci_dev *dev)
+ static inline int pcie_aer_is_native(struct pci_dev *dev) { return 0; }
+ #endif
+ 
++#ifdef CONFIG_PCIEAER_CXL
++void pci_aer_unmask_internal_errors(struct pci_dev *dev);
++#else
++static inline void pci_aer_unmask_internal_errors(struct pci_dev *dev) { }
++#endif
++
+ void pci_print_aer(struct pci_dev *dev, int aer_severity,
+ 		    struct aer_capability_regs *aer);
+ int cper_severity_to_aer(int cper_severity);
+-- 
+2.43.0
+
+
+From f1cc7e2bd9146faa181ba78e0bee89fb96d687d4 Mon Sep 17 00:00:00 2001
+From: Terry Bowman <terry.bowman@amd.com>
+Date: Mon, 17 Jun 2024 15:04:11 -0500
+Subject: [PATCH 9/9] cxl/pci: Enable interrupts for CXL PCIe ports' AER
+ internal errors
+Status: O
+Content-Length: 1580
+Lines: 50
+
+CXL RAS errors are reported through AER interrupts using the AER status:
+correctbale internal errors (CIE) and AER uncorrectable internal errors
+(UIE).[1] But, the AER CIE/UIE are disabled by default preventing
+notification of CXL RAS errors.[2]
+
+Enable CXL PCIe port RAS notification by unmasking the ports' AER CIE
+and UIE errors.
+
+[1] CXL3.1 - 12.2.2 CXL Root Ports, Downstream Switch Ports, and Upstream
+             Switch Ports
+[2] PCI6.0 - 7.8.4.3 Uncorrectable Error Mask Register (Offset 08h),
+             7.8.4.6 Correctable Error Mask Register (Offset 14h)
+
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+---
+ drivers/cxl/core/pci.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index c76aa9b460b0..2351aa4827bc 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -861,6 +861,12 @@ void cxl_setup_parent_uport(struct device *host, struct cxl_port *port)
+ 	struct device *uport_dev = port->uport_dev;
+ 
+ 	cxl_port_map_regs(uport_dev, map, regs);
++
++	if (dev_is_pci(uport_dev)) {
++		struct pci_dev *pdev = to_pci_dev(uport_dev);
++
++		pci_aer_unmask_internal_errors(pdev);
++	}
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_setup_parent_uport, CXL);
+ 
+@@ -878,6 +884,12 @@ void cxl_setup_parent_dport(struct device *host, struct cxl_dport *dport)
+ 
+ 	if (dport->rch)
+ 		cxl_disable_rch_root_ints(dport);
++
++	if (dev_is_pci(dport_dev)) {
++		struct pci_dev *pdev = to_pci_dev(dport_dev);
++
++		pci_aer_unmask_internal_errors(pdev);
++	}
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_setup_parent_dport, CXL);
+ 
+-- 
+2.43.0
+
